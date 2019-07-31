@@ -43,7 +43,6 @@ export function selectionSetToTypes(
         case Kind.FIELD: {
           if (isObjectType(parentType) || isInterfaceType(parentType)) {
             const selectionName = selection.alias && selection.alias.value ? selection.alias.value : selection.name.value;
-
             if (!selectionName.startsWith('__')) {
               const field = parentType.getFields()[selection.name.value];
               const baseType = getBaseType(field.type);
