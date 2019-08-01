@@ -135,9 +135,17 @@ export class SelectionSetToObject {
     } else if (isObjectType(parentType)) {
       for (const node of nodes) {
         const onType = node.typeCondition.name.value;
-        const schemaType = this._schema.getType(onType);
+        const typeOnSchema = this._schema.getType(onType);
+        if (isObjectType(typeOnSchema)) {
+          let typeSelections = types.get(typeOnSchema.name);
+          if (!typeSelections) {
+            typeSelections = [];
+            types.set(typeOnSchema.name, typeSelections);
+          }
+          typeSelections.push(...node.selectionSet.selections.filter(selection => selection.kind === 'Field'));
 
-        if (isObjectType(schemaType) && schemaType.name === parentType.name) {
+          this._collectInlineFragments(typeOnSchema, node.selectionSet.selections.filter(selection => selection.kind === 'InlineFragment') as InlineFragmentNode[], types);
+        } else if (isInterfaceType(typeOnSchema) && parentType.isTypeOf(typeOnSchema, null, null)) {
           let typeSelections = types.get(parentType.name);
           if (!typeSelections) {
             typeSelections = [];
@@ -145,16 +153,7 @@ export class SelectionSetToObject {
           }
           typeSelections.push(...node.selectionSet.selections.filter(selection => selection.kind === 'Field'));
 
-          this._collectInlineFragments(schemaType, node.selectionSet.selections.filter(selection => selection.kind === 'InlineFragment') as InlineFragmentNode[], types);
-        } else if (isInterfaceType(schemaType) && parentType.isTypeOf(schemaType, null, null)) {
-          let typeSelections = types.get(parentType.name);
-          if (!typeSelections) {
-            typeSelections = [];
-            types.set(parentType.name, typeSelections);
-          }
-          typeSelections.push(...node.selectionSet.selections.filter(selection => selection.kind === 'Field'));
-
-          this._collectInlineFragments(schemaType, node.selectionSet.selections.filter(selection => selection.kind === 'InlineFragment') as InlineFragmentNode[], types);
+          this._collectInlineFragments(typeOnSchema, node.selectionSet.selections.filter(selection => selection.kind === 'InlineFragment') as InlineFragmentNode[], types);
         }
       }
     } else if (isInterfaceType(parentType)) {
@@ -291,17 +290,10 @@ export class SelectionSetToObject {
           },
         };
         inlineFragmentSelections.push(inlineFragment);
-        // console.log(JSON.stringify(inlineFragment, undefined, 2));
       }
-
-      // console.log(JSON.stringify(inlineFragmentSelections, undefined, 2));
 
       const types = new Map<string, SelectionNode[]>();
       this._collectInlineFragments(this._parentSchemaType, inlineFragmentSelections, types);
-
-      // console.log(types);
-      const typePrefix = this._namespacedImportName ? `${this._namespacedImportName}.` : '';
-
       return Array.from(types.entries())
         .map(([name, fields]) => {
           const primitiveFields: FieldNode[] = [];
@@ -321,10 +313,13 @@ export class SelectionSetToObject {
             } else {
               let selectedField: GraphQLField<any, any, any> = null;
 
-              if (isInterfaceType(this._parentSchemaType) || isObjectType(this._parentSchemaType)) {
+              if (isObjectType(this._parentSchemaType)) {
                 const fields = this._parentSchemaType.getFields();
                 selectedField = fields[field.name.value];
-                if (!selectedField && isInterfaceType(this._parentSchemaType)) {
+              } else if (isInterfaceType(this._parentSchemaType)) {
+                const fields = this._parentSchemaType.getFields();
+                selectedField = fields[field.name.value];
+                if (!selectedField) {
                   const possibleTypes = this._schema.getPossibleTypes(this._parentSchemaType);
                   for (const possibleType of possibleTypes) {
                     selectedField = possibleType.getFields()[field.name.value];
@@ -333,13 +328,22 @@ export class SelectionSetToObject {
                     }
                   }
                 }
+              } else if (isUnionType(this._parentSchemaType)) {
+                const types = this._parentSchemaType.getTypes();
+                for (const type of types) {
+                  const fields = type.getFields();
+                  selectedField = fields[field.name.value];
+                  if (selectedField) {
+                    break;
+                  }
+                }
               }
 
               if (!selectedField) {
-                throw new TypeError(`Could not find field type.`);
+                throw new TypeError(`Could not find field type. ${this._parentSchemaType}.${field.name.value}`);
               }
 
-              const selectedFieldType = getBaseType(selectedField.type);
+              const selectedFieldType = getBaseType(selectedField.type as any);
               const selectionSet = this.createNext(selectedFieldType, field.selectionSet);
 
               linkFields.push({
