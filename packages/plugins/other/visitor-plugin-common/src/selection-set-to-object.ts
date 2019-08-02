@@ -18,6 +18,7 @@ import {
   SelectionNode,
   isListType,
   isNonNullType,
+  GraphQLOutputType,
 } from 'graphql';
 import { getBaseType, quoteIfNeeded, isRootType, getBaseTypeNode } from './utils';
 import { ScalarsMap, ConvertNameFn, LoadedFragment } from './types';
@@ -36,6 +37,37 @@ function isMetadataFieldName(name: string) {
 const metadataFieldMap: Record<string, GraphQLField<any, any>> = {
   __schema: SchemaMetaFieldDef,
   __type: TypeMetaFieldDef,
+};
+
+const getFieldNodeNameValue = (node: FieldNode): string => {
+  return (node.alias || node.name).value;
+};
+
+const mergeSelectionSets = (selectionSet1: SelectionSetNode, selectionSet2: SelectionSetNode) => {
+  const newSelections = [...selectionSet1.selections];
+  for (const selection2 of selectionSet2.selections) {
+    if (selection2.kind === 'FragmentSpread') {
+      newSelections.push(selection2);
+      continue;
+    }
+    if (selection2.kind !== 'Field') {
+      throw new TypeError('Invalid state.');
+    }
+
+    const match = newSelections.find(selection1 => selection1.kind === 'Field' && getFieldNodeNameValue(selection1) === getFieldNodeNameValue(selection2));
+
+    if (match) {
+      // recursively merge all selection sets
+      if (match.kind === 'Field' && match.selectionSet && selection2.selectionSet) {
+        mergeSelectionSets(match.selectionSet, selection2.selectionSet);
+      }
+      continue;
+    }
+    newSelections.push(selection2);
+  }
+
+  // replace existing selections
+  selectionSet1.selections = newSelections;
 };
 
 export class SelectionSetToObject {
@@ -128,9 +160,7 @@ export class SelectionSetToObject {
   }
 
   _collectInlineFragments(parentType: GraphQLNamedType, nodes: InlineFragmentNode[], types: Map<string, SelectionNode[]>) {
-    if (isListType(parentType)) {
-      return this._collectInlineFragments(parentType.ofType, nodes, types);
-    } else if (isNonNullType(parentType)) {
+    if (isListType(parentType) || isNonNullType(parentType)) {
       return this._collectInlineFragments(parentType.ofType, nodes, types);
     } else if (isObjectType(parentType)) {
       for (const node of nodes) {
@@ -294,11 +324,18 @@ export class SelectionSetToObject {
 
       const types = new Map<string, SelectionNode[]>();
       this._collectInlineFragments(this._parentSchemaType, inlineFragmentSelections, types);
+
       return Array.from(types.entries())
         .map(([name, fields]) => {
           const primitiveFields: FieldNode[] = [];
           const primitiveAliasFields: FieldNode[] = [];
-          const linkFields: LinkField[] = [];
+          const linkFieldSelectionSets = new Map<
+            string,
+            {
+              selectedFieldType: GraphQLOutputType;
+              field: FieldNode;
+            }
+          >();
           let requireTypename = false;
 
           for (const field of fields as FieldNode[]) {
@@ -343,16 +380,31 @@ export class SelectionSetToObject {
                 throw new TypeError(`Could not find field type. ${this._parentSchemaType}.${field.name.value}`);
               }
 
-              const selectedFieldType = getBaseType(selectedField.type as any);
-              const selectionSet = this.createNext(selectedFieldType, field.selectionSet);
-
-              linkFields.push({
-                alias: field.alias ? field.alias.value : undefined,
-                name: field.name.value,
-                type: selectedFieldType.name,
-                selectionSet: this.wrapTypeWithModifiers(selectionSet.string, selectedField.type as any),
-              });
+              const fieldName = getFieldNodeNameValue(field);
+              let linkFieldNode = linkFieldSelectionSets.get(fieldName);
+              if (!linkFieldNode) {
+                linkFieldNode = {
+                  selectedFieldType: selectedField.type,
+                  field,
+                };
+                linkFieldSelectionSets.set(fieldName, linkFieldNode);
+              } else {
+                mergeSelectionSets(linkFieldNode.field.selectionSet, field.selectionSet);
+              }
             }
+          }
+
+          const linkFields: LinkField[] = [];
+          for (const { field, selectedFieldType } of linkFieldSelectionSets.values()) {
+            const realSelectedFieldType = getBaseType(selectedFieldType as any);
+            const selectionSet = this.createNext(realSelectedFieldType, field.selectionSet);
+
+            linkFields.push({
+              alias: field.alias ? field.alias.value : undefined,
+              name: field.name.value,
+              type: realSelectedFieldType.name,
+              selectionSet: this.wrapTypeWithModifiers(selectionSet.string, selectedFieldType as any),
+            });
           }
 
           const parentName =
@@ -360,11 +412,15 @@ export class SelectionSetToObject {
             this._convertName(name, {
               useTypesPrefix: true,
             });
-          const typeInfoString = `\n  { ${this.formatNamedField(`__typename`)}${requireTypename ? '' : '?'}: '${name}' }`;
-          const primitiveFieldsString = primitiveFields.length ? `\n  & ${this.buildPrimitiveFields(parentName, primitiveFields.map(field => field.name.value))}` : ``;
-          const linkFieldsString = linkFields.length ? `\n  & ${this.buildLinkFields(linkFields)}` : ``;
+          let typeInfoString: null | string = null;
+          if (this._nonOptionalTypename || this._addTypename || this._queriedForTypename) {
+            const optionalTypename = !requireTypename && !this._nonOptionalTypename;
+            typeInfoString = `{ ${this.formatNamedField('__typename')}${optionalTypename ? '?' : ''}: '${name}' }`;
+          }
+          const primitiveFieldsString = this.buildPrimitiveFields(parentName, primitiveFields.map(field => field.name.value));
+          const linkFieldsString = this.buildLinkFields(linkFields);
 
-          return `(${typeInfoString}${primitiveFieldsString}${linkFieldsString}\n)`;
+          return '(\n  ' + [typeInfoString, primitiveFieldsString, linkFieldsString].filter(Boolean).join('\n  & ') + '\n)';
         })
         .join(' | ');
     } else {
